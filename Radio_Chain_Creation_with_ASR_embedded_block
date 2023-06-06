@@ -1,0 +1,113 @@
+import datetime
+import time
+import numpy as np
+from gnuradio import gr, analog, filter, blocks, audio
+from gnuradio.filter import firdes
+
+class blk(gr.sync_block):
+    def __init__(self, sample_rate=16e3): 
+        gr.sync_block.__init__(
+            self,
+            name='Embedded ASR Block',
+            in_sig=[np.float32],
+            out_sig=[]
+        )
+        self.benchmark = False  
+        self.sample_rate = sample_rate
+        self.engine = None
+        self.new_line = True
+        if sample_rate != 16000.0:
+            raise ValueError("Only 16kHz sample rates are supported by this model")
+
+    def start(self):
+        from radio_asr.online import SpeechInference
+        if self.engine:
+            del self.engine
+        print("Creating and initializing speech inference model.")
+        self.engine = SpeechInference(sample_rate=self.sample_rate)
+        self.buffer = np.zeros(self.engine.n_frame_len)
+        self.pos = 0
+        self.buf_duration = self.engine.n_frame_len / self.sample_rate
+        print("Finished initializing speech inference model.")
+        return True
+
+    def work(self, input_items, output_items):
+        data = input_items[0]
+        n_samples = len(data)
+        if self.pos + n_samples < self.engine.n_frame_len:
+            self.buffer[self.pos:self.pos+n_samples] = data
+            self.pos += n_samples
+            return n_samples
+        else:
+            n_processed = self.engine.n_frame_len - self.pos
+            self.buffer[self.pos:] = data[:n_processed]
+
+            t_start = time.time()
+            text = self.engine.transcribe(self.buffer)
+            t_end = time.time()
+            t_duration = t_end - t_start
+            ratio = self.buf_duration / t_duration
+
+            text = text.strip()
+
+            if len(text):
+                self.new_line = False
+                print(" " + text, end='', flush=True)
+            elif not self.new_line:
+                print("", end='\n', flush=True)
+                self.new_line = True
+
+            if self.benchmark:
+                now = datetime.datetime.now()
+                print(f"[{now}] Transcribed {self.buf_duration:.2f}sec in {t_duration:.2f}sec ({ratio:.2f}x): '{text}'")
+
+            self.pos = 0
+            return n_processed
+
+class RecordBlock(gr.sync_block):
+    def __init__(self, sample_rate=2.4e6):
+        gr.sync_block.__init__(
+            self,
+            name='RecordBlock',
+            in_sig=[np.complex64],
+            out_sig=[]
+        )
+
+        self.sample_rate = sample_rate
+        self.psd_threshold = 2e-08  
+        self.transition_width = 1000  
+        self.max_deviation = 5000  
+        self.audio_rate = 44100  
+        self.radio_chains = []  
+
+    def work(self, input_items, output_items):
+        in0 = input_items[0]
+        frequencies, peak_psds = self.detect_peak_frequencies(in0)
+        for frequency, peak_psd in zip(frequencies, peak_psds):
+            if peak_psd > self.psd_threshold:
+                radio_chain = self.create_radio_chain(self.sample_rate, frequency, self.transition_width, self.max_deviation, self.audio_rate)
+                radio_chain.start()
+                self.radio_chains.append(radio_chain)
+        return len(in0)
+
+    def create_radio_chain(self, sample_rate, frequency, transition_width, max_deviation, audio_rate):
+        cutoff_freq = frequency + max_deviation
+
+        lpf_coeffs = filter.firdes.low_pass(1, sample_rate, cutoff_freq, transition_width, filter.firdes.WIN_HAMMING)
+        lpf = filter.freq_xlating_fir_filter_ccf(1, lpf_coeffs, frequency, sample_rate)
+
+        squelch = analog.pwr_squelch_cc(-70, 1, 0, True)
+
+        fm_demod = analog.nbfm_receive(sample_rate, audio_rate, max_deviation, -75)
+
+        custom_processing_block = blk(self.audio_rate)
+
+        radio_chain = gr.top_block()
+        radio_chain.connect(lpf, squelch, fm_demod, custom_processing_block)
+
+        return radio_chain
+
+    def detect_peak_frequencies(self, data):
+        frequencies = [100e6] 
+        peak_psds = [3e-08]  
+        return frequencies, peak_psds
